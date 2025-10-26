@@ -6,24 +6,15 @@ import torch
 if torch.version.cuda == '11.8':
     os.environ["TRITON_PTXAS_PATH"] = "/usr/local/cuda-11.8/bin/ptxas"
 
-os.environ['VLLM_USE_V1'] = '0'
-os.environ["CUDA_VISIBLE_DEVICES"] = '0'
 
 from vllm import AsyncLLMEngine, SamplingParams
 from vllm.engine.arg_utils import AsyncEngineArgs
-from vllm.model_executor.models.registry import ModelRegistry
+from vllm.model_executor.models.deepseek_ocr import NGramPerReqLogitsProcessor
 import time
-from deepseek_ocr import DeepseekOCRForCausalLM
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 import numpy as np
 from tqdm import tqdm
-from process.ngram_norepeat import NoRepeatNGramLogitsProcessor
-from process.image_process import DeepseekOCRProcessor
 from config import MODEL_PATH, INPUT_PATH, OUTPUT_PATH, PROMPT, CROP_MODE
-
-
-
-ModelRegistry.register_model("DeepseekOCRForCausalLM", DeepseekOCRForCausalLM)
 
 def load_image(image_path):
 
@@ -70,7 +61,7 @@ def extract_coordinates_and_label(ref_text, image_width, image_height):
     return (label_type, cor_list)
 
 
-def draw_bounding_boxes(image, refs):
+def draw_bounding_boxes(image, refs, output_path):
 
     image_width, image_height = image.size
     img_draw = image.copy()
@@ -105,7 +96,7 @@ def draw_bounding_boxes(image, refs):
                     if label_type == 'image':
                         try:
                             cropped = image.crop((x1, y1, x2, y2))
-                            cropped.save(f"{OUTPUT_PATH}/images/{img_idx}.jpg")
+                            cropped.save(f"{output_path}/images/{img_idx}.jpg")
                         except Exception as e:
                             print(e)
                             pass
@@ -137,8 +128,8 @@ def draw_bounding_boxes(image, refs):
     return img_draw
 
 
-def process_image_with_refs(image, ref_texts):
-    result_image = draw_bounding_boxes(image, ref_texts)
+def process_image_with_refs(image, ref_texts, output_path):
+    result_image = draw_bounding_boxes(image, ref_texts, output_path)
     return result_image
 
 
@@ -149,22 +140,24 @@ async def stream_generate(image=None, prompt=''):
 
     engine_args = AsyncEngineArgs(
         model=MODEL_PATH,
-        hf_overrides={"architectures": ["DeepseekOCRForCausalLM"]},
-        block_size=256,
+        enable_prefix_caching=False,
+        mm_processor_cache_gb=0,
         max_model_len=8192,
-        enforce_eager=False,
         trust_remote_code=True,  
         tensor_parallel_size=1,
         gpu_memory_utilization=0.75,
+        logits_processors=[NGramPerReqLogitsProcessor]
     )
     engine = AsyncLLMEngine.from_engine_args(engine_args)
     
-    logits_processors = [NoRepeatNGramLogitsProcessor(ngram_size=30, window_size=90, whitelist_token_ids= {128821, 128822})] #whitelist: <td>, </td> 
-
     sampling_params = SamplingParams(
         temperature=0.0,
         max_tokens=8192,
-        logits_processors=logits_processors,
+        extra_args=dict(
+            ngram_size=30,
+            window_size=90,
+            whitelist_token_ids={128821, 128822},
+        ),
         skip_special_tokens=False,
         # ignore_eos=False,
         
@@ -202,20 +195,36 @@ async def stream_generate(image=None, prompt=''):
 
 
 if __name__ == "__main__":
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='DeepSeek-OCR Image Processing (Streaming)')
+    parser.add_argument('--input', '-i', type=str, default=INPUT_PATH, help='Input image path')
+    parser.add_argument('--output', '-o', type=str, default=OUTPUT_PATH, help='Output directory path')
+    parser.add_argument('--prompt', '-p', type=str, default=PROMPT, help='OCR prompt')
+    parser.add_argument('--debug', '-d', action='store_true', help='Enable debug mode')
+    args = parser.parse_args()
+    
+    input_path = args.input if args.input else INPUT_PATH
+    output_path = args.output if args.output else OUTPUT_PATH
+    prompt = args.prompt if args.prompt else PROMPT
+    
+    if not input_path:
+        print('Error: INPUT_PATH is not specified. Use --input or set INPUT_PATH in config.py')
+        exit(1)
+    if not output_path:
+        print('Error: OUTPUT_PATH is not specified. Use --output or set OUTPUT_PATH in config.py')
+        exit(1)
 
-    os.makedirs(OUTPUT_PATH, exist_ok=True)
-    os.makedirs(f'{OUTPUT_PATH}/images', exist_ok=True)
+    os.makedirs(output_path, exist_ok=True)
+    os.makedirs(f'{output_path}/images', exist_ok=True)
 
-    image = load_image(INPUT_PATH).convert('RGB')
+    image = load_image(input_path).convert('RGB')
 
     
-    if '<image>' in PROMPT:
-
-        image_features = DeepseekOCRProcessor().tokenize_with_images(images = [image], bos=True, eos=True, cropping=CROP_MODE)
+    if '<image>' in prompt:
+        image_features = image
     else:
         image_features = ''
-
-    prompt = PROMPT
 
     result_out = asyncio.run(stream_generate(image_features, prompt))
 
@@ -229,12 +238,12 @@ if __name__ == "__main__":
 
         outputs = result_out
 
-        with open(f'{OUTPUT_PATH}/result_ori.mmd', 'w', encoding = 'utf-8') as afile:
+        with open(f'{output_path}/result_ori.md', 'w', encoding = 'utf-8') as afile:
             afile.write(outputs)
 
         matches_ref, matches_images, mathes_other = re_match(outputs)
         # print(matches_ref)
-        result = process_image_with_refs(image_draw, matches_ref)
+        result = process_image_with_refs(image_draw, matches_ref, output_path)
 
 
         for idx, a_match_image in enumerate(tqdm(matches_images, desc="image")):
@@ -245,7 +254,7 @@ if __name__ == "__main__":
 
         # if 'structural formula' in conversation[0]['content']:
         #     outputs = '<smiles>' + outputs + '</smiles>'
-        with open(f'{OUTPUT_PATH}/result.mmd', 'w', encoding = 'utf-8') as afile:
+        with open(f'{output_path}/result.md', 'w', encoding = 'utf-8') as afile:
             afile.write(outputs)
 
         if 'line_type' in outputs:
@@ -297,7 +306,10 @@ if __name__ == "__main__":
                 pass
 
 
-            plt.savefig(f'{OUTPUT_PATH}/geo.jpg')
+            plt.savefig(f'{output_path}/geo.jpg')
             plt.close()
 
-        result.save(f'{OUTPUT_PATH}/result_with_boxes.jpg')
+        result.save(f'{output_path}/result_with_boxes.jpg')
+        print(f'\n✓ Done! Results saved to {output_path}')
+    
+    print('Note: AsyncEngine cleanup messages are normal.')

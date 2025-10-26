@@ -4,42 +4,36 @@ from tqdm import tqdm
 import torch
 if torch.version.cuda == '11.8':
     os.environ["TRITON_PTXAS_PATH"] = "/usr/local/cuda-11.8/bin/ptxas"
-os.environ['VLLM_USE_V1'] = '0'
-os.environ["CUDA_VISIBLE_DEVICES"] = '0'
 
 from config import MODEL_PATH, INPUT_PATH, OUTPUT_PATH, PROMPT, MAX_CONCURRENCY, CROP_MODE, NUM_WORKERS
 from concurrent.futures import ThreadPoolExecutor
 import glob
 from PIL import Image
-from deepseek_ocr import DeepseekOCRForCausalLM
-
-from vllm.model_executor.models.registry import ModelRegistry
 
 from vllm import LLM, SamplingParams
-from process.ngram_norepeat import NoRepeatNGramLogitsProcessor
-from process.image_process import DeepseekOCRProcessor
-ModelRegistry.register_model("DeepseekOCRForCausalLM", DeepseekOCRForCausalLM)
+from vllm.model_executor.models.deepseek_ocr import NGramPerReqLogitsProcessor
 
 
 llm = LLM(
     model=MODEL_PATH,
-    hf_overrides={"architectures": ["DeepseekOCRForCausalLM"]},
-    block_size=256,
-    enforce_eager=False,
+    enable_prefix_caching=False,
+    mm_processor_cache_gb=0,
     trust_remote_code=True, 
     max_model_len=8192,
-    swap_space=0,
     max_num_seqs = MAX_CONCURRENCY,
     tensor_parallel_size=1,
     gpu_memory_utilization=0.9,
+    logits_processors=[NGramPerReqLogitsProcessor]
 )
-
-logits_processors = [NoRepeatNGramLogitsProcessor(ngram_size=40, window_size=90, whitelist_token_ids= {128821, 128822})] #window for fast；whitelist_token_ids: <td>,</td>
 
 sampling_params = SamplingParams(
     temperature=0.0,
     max_tokens=8192,
-    logits_processors=logits_processors,
+    extra_args=dict(
+        ngram_size=40,
+        window_size=90,
+        whitelist_token_ids={128821, 128822},
+    ),
     skip_special_tokens=False,
 )
 
@@ -80,33 +74,52 @@ def re_match(text):
 
 def process_single_image(image):
     """single image"""
+    if image.mode != 'RGB':
+        image = image.convert('RGB')
     prompt_in = prompt
     cache_item = {
         "prompt": prompt_in,
-        "multi_modal_data": {"image": DeepseekOCRProcessor().tokenize_with_images(images = [image], bos=True, eos=True, cropping=CROP_MODE)},
+        "multi_modal_data": {"image": image},
     }
     return cache_item
 
 
 if __name__ == "__main__":
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='DeepSeek-OCR Batch Evaluation')
+    parser.add_argument('--input', '-i', type=str, default=INPUT_PATH, help='Input directory path (images)')
+    parser.add_argument('--output', '-o', type=str, default=OUTPUT_PATH, help='Output directory path')
+    parser.add_argument('--prompt', '-p', type=str, default=PROMPT, help='OCR prompt')
+    parser.add_argument('--debug', '-d', action='store_true', help='Enable debug mode')
+    args = parser.parse_args()
+    
+    input_path = args.input if args.input else INPUT_PATH
+    output_path = args.output if args.output else OUTPUT_PATH
+    prompt = args.prompt if args.prompt else PROMPT
+    
+    if not input_path:
+        print(f'{Colors.RED}Error: INPUT_PATH is not specified. Use --input or set INPUT_PATH in config.py{Colors.RESET}')
+        exit(1)
+    if not output_path:
+        print(f'{Colors.RED}Error: OUTPUT_PATH is not specified. Use --output or set OUTPUT_PATH in config.py{Colors.RESET}')
+        exit(1)
 
     # INPUT_PATH = OmniDocBench images path
 
-    os.makedirs(OUTPUT_PATH, exist_ok=True)
+    os.makedirs(output_path, exist_ok=True)
 
     # print('image processing until processing prompts.....')
 
     print(f'{Colors.RED}glob images.....{Colors.RESET}')
 
-    images_path = glob.glob(f'{INPUT_PATH}/*')
+    images_path = glob.glob(f'{input_path}/*')
 
     images = []
 
     for image_path in images_path:
         image = Image.open(image_path).convert('RGB')
         images.append(image)
-
-    prompt = PROMPT
 
     # batch_inputs = []
 
@@ -138,24 +151,47 @@ if __name__ == "__main__":
     )
 
 
-    output_path = OUTPUT_PATH
-
     os.makedirs(output_path, exist_ok=True)
 
+    print(f'{Colors.GREEN}Processing results...{Colors.RESET}')
+    processed_count = 0
+    error_count = 0
+
     for output, image in zip(outputs_list, images_path):
+        try:
+            content = output.outputs[0].text
+            base_name = os.path.basename(image)
+            name_without_ext = os.path.splitext(base_name)[0]
 
-        content = output.outputs[0].text
-        mmd_det_path = output_path + image.split('/')[-1].replace('.jpg', '_det.md')
+            mmd_det_path = output_path + '/' + name_without_ext + '_det.md'
 
-        with open(mmd_det_path, 'w', encoding='utf-8') as afile:
-            afile.write(content)
+            with open(mmd_det_path, 'w', encoding='utf-8') as afile:
+                afile.write(content)
 
-        content = clean_formula(content)
-        matches_ref, mathes_other = re_match(content)
-        for idx, a_match_other in enumerate(tqdm(mathes_other, desc="other")):
-            content = content.replace(a_match_other, '').replace('\n\n\n\n', '\n\n').replace('\n\n\n', '\n\n').replace('<center>', '').replace('</center>', '')
-        
-        mmd_path = output_path + image.split('/')[-1].replace('.jpg', '.md')
+            content = clean_formula(content)
+            matches_ref, mathes_other = re_match(content)
+            for idx, a_match_other in enumerate(tqdm(mathes_other, desc="other", leave=False)):
+                content = content.replace(a_match_other, '').replace('\n\n\n\n', '\n\n').replace('\n\n\n', '\n\n').replace('<center>', '').replace('</center>', '')
+            
+            mmd_path = output_path + '/' + name_without_ext + '.md'
 
-        with open(mmd_path, 'w', encoding='utf-8') as afile:
-            afile.write(content)
+            with open(mmd_path, 'w', encoding='utf-8') as afile:
+                afile.write(content)
+            
+            processed_count += 1
+        except Exception as e:
+            print(f'{Colors.RED}Error processing {image}: {e}{Colors.RESET}')
+            error_count += 1
+            continue
+    
+    print(f'{Colors.GREEN}Done! Processed {processed_count} images, {error_count} errors{Colors.RESET}')
+    
+    # Clean up LLM engine to avoid "died unexpectedly" error
+    try:
+        del llm
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except:
+        pass

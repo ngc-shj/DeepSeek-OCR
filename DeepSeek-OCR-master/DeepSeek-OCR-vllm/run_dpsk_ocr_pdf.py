@@ -10,7 +10,6 @@ from concurrent.futures import ThreadPoolExecutor
 
 if torch.version.cuda == '11.8':
     os.environ["TRITON_PTXAS_PATH"] = "/usr/local/cuda-11.8/bin/ptxas"
-os.environ['VLLM_USE_V1'] = '0'
 os.environ["CUDA_VISIBLE_DEVICES"] = '0'
 
 
@@ -18,39 +17,32 @@ from config import MODEL_PATH, INPUT_PATH, OUTPUT_PATH, PROMPT, SKIP_REPEAT, MAX
 
 from PIL import Image, ImageDraw, ImageFont
 import numpy as np
-from deepseek_ocr import DeepseekOCRForCausalLM
-
-from vllm.model_executor.models.registry import ModelRegistry
 
 from vllm import LLM, SamplingParams
-from process.ngram_norepeat import NoRepeatNGramLogitsProcessor
-from process.image_process import DeepseekOCRProcessor
-
-ModelRegistry.register_model("DeepseekOCRForCausalLM", DeepseekOCRForCausalLM)
+from vllm.model_executor.models.deepseek_ocr import NGramPerReqLogitsProcessor
 
 
 llm = LLM(
     model=MODEL_PATH,
-    hf_overrides={"architectures": ["DeepseekOCRForCausalLM"]},
-    block_size=256,
-    enforce_eager=False,
+    enable_prefix_caching=False,
+    mm_processor_cache_gb=0,
     trust_remote_code=True, 
     max_model_len=8192,
-    swap_space=0,
     max_num_seqs=MAX_CONCURRENCY,
     tensor_parallel_size=1,
     gpu_memory_utilization=0.9,
-    disable_mm_preprocessor_cache=True
+    logits_processors=[NGramPerReqLogitsProcessor]
 )
-
-logits_processors = [NoRepeatNGramLogitsProcessor(ngram_size=20, window_size=50, whitelist_token_ids= {128821, 128822})] #window for fast；whitelist_token_ids: <td>,</td>
 
 sampling_params = SamplingParams(
     temperature=0.0,
     max_tokens=8192,
-    logits_processors=logits_processors,
+    extra_args=dict(
+        ngram_size=30,
+        window_size=90,
+        whitelist_token_ids={128821, 128822},
+    ),
     skip_special_tokens=False,
-    include_stop_str_in_output=True,
 )
 
 
@@ -148,7 +140,7 @@ def extract_coordinates_and_label(ref_text, image_width, image_height):
     return (label_type, cor_list)
 
 
-def draw_bounding_boxes(image, refs, jdx):
+def draw_bounding_boxes(image, refs, jdx, output_path):
 
     image_width, image_height = image.size
     img_draw = image.copy()
@@ -183,7 +175,7 @@ def draw_bounding_boxes(image, refs, jdx):
                     if label_type == 'image':
                         try:
                             cropped = image.crop((x1, y1, x2, y2))
-                            cropped.save(f"{OUTPUT_PATH}/images/{jdx}_{img_idx}.jpg")
+                            cropped.save(f"{output_path}/images/{jdx}_{img_idx}.jpg")
                         except Exception as e:
                             print(e)
                             pass
@@ -215,33 +207,54 @@ def draw_bounding_boxes(image, refs, jdx):
     return img_draw
 
 
-def process_image_with_refs(image, ref_texts, jdx):
-    result_image = draw_bounding_boxes(image, ref_texts, jdx)
+def process_image_with_refs(image, ref_texts, jdx, output_path):
+    result_image = draw_bounding_boxes(image, ref_texts, jdx, output_path)
     return result_image
 
 
 def process_single_image(image):
     """single image"""
+    if image.mode != 'RGB':
+        image = image.convert('RGB')
     prompt_in = prompt
     cache_item = {
         "prompt": prompt_in,
-        "multi_modal_data": {"image": DeepseekOCRProcessor().tokenize_with_images(images = [image], bos=True, eos=True, cropping=CROP_MODE)},
+        "multi_modal_data": {"image": image},
     }
     return cache_item
 
 
 if __name__ == "__main__":
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='DeepSeek-OCR PDF Processing')
+    parser.add_argument('--input', '-i', type=str, default=INPUT_PATH, help='Input PDF path')
+    parser.add_argument('--output', '-o', type=str, default=OUTPUT_PATH, help='Output directory path')
+    parser.add_argument('--prompt', '-p', type=str, default=PROMPT, help='OCR prompt')
+    parser.add_argument('--debug', '-d', action='store_true', help='Enable debug mode (show first 200 chars of each output)')
+    args = parser.parse_args()
+    
+    input_path = args.input if args.input else INPUT_PATH
+    output_path = args.output if args.output else OUTPUT_PATH
+    prompt = args.prompt if args.prompt else PROMPT
+    
+    if not input_path:
+        print(f'{Colors.RED}Error: INPUT_PATH is not specified. Use --input or set INPUT_PATH in config.py{Colors.RESET}')
+        exit(1)
+    if not output_path:
+        print(f'{Colors.RED}Error: OUTPUT_PATH is not specified. Use --output or set OUTPUT_PATH in config.py{Colors.RESET}')
+        exit(1)
 
-    os.makedirs(OUTPUT_PATH, exist_ok=True)
-    os.makedirs(f'{OUTPUT_PATH}/images', exist_ok=True)
+    os.makedirs(output_path, exist_ok=True)
+    os.makedirs(f'{output_path}/images', exist_ok=True)
     
     print(f'{Colors.RED}PDF loading .....{Colors.RESET}')
 
 
-    images = pdf_to_images_high_quality(INPUT_PATH)
+    images = pdf_to_images_high_quality(input_path)
 
 
-    prompt = PROMPT
+    prompt = args.prompt if args.prompt else PROMPT
 
     # batch_inputs = []
 
@@ -271,53 +284,83 @@ if __name__ == "__main__":
     )
 
 
-    output_path = OUTPUT_PATH
+    print(f'{Colors.GREEN}Processing results...{Colors.RESET}')
+
+    output_path = output_path
 
     os.makedirs(output_path, exist_ok=True)
 
 
-    mmd_det_path = output_path + '/' + INPUT_PATH.split('/')[-1].replace('.pdf', '_det.mmd')
-    mmd_path = output_path + '/' + INPUT_PATH.split('/')[-1].replace('pdf', 'mmd')
-    pdf_out_path = output_path + '/' + INPUT_PATH.split('/')[-1].replace('.pdf', '_layouts.pdf')
+    base_name = os.path.basename(input_path)
+    name_without_ext = os.path.splitext(base_name)[0]
+
+    mmd_det_path = output_path + '/' + name_without_ext + '_det.md'
+    mmd_path = output_path + '/' + name_without_ext + '.md'
+    pdf_out_path = output_path + '/' + name_without_ext + '_layouts.pdf'
     contents_det = ''
     contents = ''
     draw_images = []
     jdx = 0
+    skipped_pages = 0
     for output, img in zip(outputs_list, images):
-        content = output.outputs[0].text
+        try:
+            content = output.outputs[0].text
+            
+            if args.debug:
+                print(f'{Colors.BLUE}[DEBUG] Page {jdx} output (first 200 chars): {content[:200]}...{Colors.RESET}')
+                print(f'{Colors.BLUE}[DEBUG] Page {jdx} output length: {len(content)} chars{Colors.RESET}')
+            
+            # Check for incomplete generation (repetition without proper EOS)
+            has_proper_eos = '<｜end▁of▁sentence｜>' in content or content.endswith('<|end|>') or content.endswith('</s>')
+            
+            if not has_proper_eos and SKIP_REPEAT:
+                # Check if content seems incomplete (very short or ends abruptly)
+                if len(content) < 50 or content.count('\n') < 2:
+                    print(f'{Colors.YELLOW}Skipping page {jdx} (incomplete generation, length: {len(content)}){Colors.RESET}')
+                    skipped_pages += 1
+                    continue
+                else:
+                    # Content seems substantial, keep it even without proper EOS
+                    print(f'{Colors.BLUE}Warning: page {jdx} has no proper EOS but content seems complete (length: {len(content)}), processing anyway{Colors.RESET}')
 
-        if '<｜end▁of▁sentence｜>' in content: # repeat no eos
+            # Clean up EOS markers
             content = content.replace('<｜end▁of▁sentence｜>', '')
-        else:
-            if SKIP_REPEAT:
-                continue
+            content = content.replace('<|end|>', '')
+            content = content.replace('</s>', '')
 
-        
-        page_num = f'\n<--- Page Split --->'
+            
+            page_num = f'\n<--- Page Split --->'
 
-        contents_det += content + f'\n{page_num}\n'
+            contents_det += content + f'\n{page_num}\n'
 
-        image_draw = img.copy()
+            image_draw = img.copy()
 
-        matches_ref, matches_images, mathes_other = re_match(content)
-        # print(matches_ref)
-        result_image = process_image_with_refs(image_draw, matches_ref, jdx)
-
-
-        draw_images.append(result_image)
+            matches_ref, matches_images, mathes_other = re_match(content)
+            # print(matches_ref)
+            result_image = process_image_with_refs(image_draw, matches_ref, jdx, output_path)
 
 
-        for idx, a_match_image in enumerate(matches_images):
-            content = content.replace(a_match_image, f'![](images/' + str(jdx) + '_' + str(idx) + '.jpg)\n')
-
-        for idx, a_match_other in enumerate(mathes_other):
-            content = content.replace(a_match_other, '').replace('\\coloneqq', ':=').replace('\\eqqcolon', '=:').replace('\n\n\n\n', '\n\n').replace('\n\n\n', '\n\n')
+            draw_images.append(result_image)
 
 
-        contents += content + f'\n{page_num}\n'
+            for idx, a_match_image in enumerate(matches_images):
+                content = content.replace(a_match_image, f'![](images/' + str(jdx) + '_' + str(idx) + '.jpg)\n')
+
+            for idx, a_match_other in enumerate(mathes_other):
+                content = content.replace(a_match_other, '').replace('\\coloneqq', ':=').replace('\\eqqcolon', '=:').replace('\n\n\n\n', '\n\n').replace('\n\n\n', '\n\n')
 
 
-        jdx += 1
+            contents += content + f'\n{page_num}\n'
+
+
+            jdx += 1
+        except Exception as e:
+            print(f'{Colors.RED}Error processing page {jdx}: {e}{Colors.RESET}')
+            import traceback
+            traceback.print_exc()
+            continue
+
+    print(f'{Colors.YELLOW}Saving results... (processed {jdx} pages, skipped {skipped_pages} pages){Colors.RESET}')
 
     with open(mmd_det_path, 'w', encoding='utf-8') as afile:
         afile.write(contents_det)
@@ -326,5 +369,18 @@ if __name__ == "__main__":
         afile.write(contents)
 
 
-    pil_to_pdf_img2pdf(draw_images, pdf_out_path)
-
+    if draw_images:
+        pil_to_pdf_img2pdf(draw_images, pdf_out_path)
+        print(f'{Colors.GREEN}Done! Results saved to {output_path}{Colors.RESET}')
+    else:
+        print(f'{Colors.YELLOW}Warning: No images to save to PDF (all pages may have been skipped){Colors.RESET}')
+    
+    # Clean up LLM engine to avoid "died unexpectedly" error
+    try:
+        del llm
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except:
+        pass
