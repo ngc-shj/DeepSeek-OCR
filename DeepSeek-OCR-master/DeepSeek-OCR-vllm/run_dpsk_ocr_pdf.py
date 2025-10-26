@@ -10,7 +10,6 @@ from concurrent.futures import ThreadPoolExecutor
 
 if torch.version.cuda == '11.8':
     os.environ["TRITON_PTXAS_PATH"] = "/usr/local/cuda-11.8/bin/ptxas"
-os.environ["CUDA_VISIBLE_DEVICES"] = '0'
 
 
 from config import MODEL_PATH, INPUT_PATH, OUTPUT_PATH, PROMPT, SKIP_REPEAT, MAX_CONCURRENCY, NUM_WORKERS, CROP_MODE
